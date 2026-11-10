@@ -265,7 +265,11 @@ function judge(now, today, air, warnings) {
   }
   const worst = Math.max(air?.grade10 || 0, air?.grade25 || 0);
   if (worst >= 3) { level = "no"; reasons.push(worst === 4 ? "미세먼지 매우나쁨" : "미세먼지 나쁨"); }
-  if (now?.pty > 0 || now?.rain1h > 0) { level = "no"; reasons.push("지금 비/눈"); }
+  if (now?.pty > 0 || now?.rain1h > 0) {
+    level = "no";
+    // 강수 형태: 1 비, 2 비/눈, 3 눈, 5 빗방울, 6 빗방울·눈날림, 7 눈날림
+    reasons.push([3, 7].includes(now?.pty) ? "지금 눈" : [2, 6].includes(now?.pty) ? "지금 비·눈" : "지금 비");
+  }
   else if (today?.rainHours?.length) { if (level === "ok") level = "caution"; reasons.push(`${today.rainHours[0].hour}시쯤 비 예보`); }
   else if (today?.popMax >= 60) { if (level === "ok") level = "caution"; reasons.push(`강수확률 ${today.popMax}%`); }
   if (today?.dawnRain && !(now?.pty > 0)) {

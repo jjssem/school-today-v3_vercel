@@ -540,7 +540,7 @@ function renderWeather(w){
   const outdoor = baseJudge ? applyWarnings(baseJudge, warn.list, !!forTomorrow) : w.outdoor;
   // 신호등 이유: 기본은 특보 모두, 3단 배치(800×480 등)에서는 빨간 띠에 나온 특보(경보·태풍)를 뺌
   const inBar = new Set(warn.list.filter(x => x.level === "경보" || x.kind === "태풍").map(x => x.name));
-  const label = r => /^[가-힣]+(주의보|경보)$/.test(r) ? r + " 발효 중" : r;
+  const label = r => /^[가-힣]+(주의보|경보)$/.test(r) ? r + " 발효 중" : r.replace("비/눈", "비·눈");   // 줄바꿈이 '/'에서 끊기지 않게
   const whyFull = (outdoor?.reasons || []).map(label);
   const SHORT = { "새벽에 비 — 운동장이 젖어 있을 수 있어요": "새벽 비·운동장 젖음", "새벽 비 — 운동장이 젖어 있을 수 있어요": "새벽 비·운동장 젖음" };
   const whyShort = (outdoor?.reasons || []).filter(r => !inBar.has(r)).map(r => SHORT[r] || label(r));
@@ -553,7 +553,10 @@ function renderWeather(w){
   if (now?.pty > 0 || now?.rain1h > 0)
     pills.push(`<div class="pill g1">지금<br><b>${[3, 7].includes(now.pty) ? "눈" : "비"} 와요</b></div>`);
   // 강수확률: 학교 시간과 상관없이 '지금' 시각의 예보값 (옛 서버 응답이면 popMax로 대신)
-  if (today) pills.push(`<div class="pill">강수확률<br><b>${today.popNow ?? today.popMax}%</b></div>`);
+  // 비/눈이 오는 동안에는 강수확률 대신 실제 1시간 강수량 (예보 확률과 섞여 헷갈리지 않게)
+  const raining = now?.pty > 0 || now?.rain1h > 0;
+  if (raining) pills.push(`<div class="pill">1시간 강수량<br><b>${now.rain1h > 0 ? now.rain1h + "mm" : "1mm 미만"}</b></div>`);
+  else if (today) pills.push(`<div class="pill">강수확률<br><b>${today.popNow ?? today.popMax}%</b></div>`);
   if (air?.pm10 != null) pills.push(`<div class="pill g${air.grade10}">미세먼지<br><b>${GRADE[air.grade10]}</b> ${air.pm10}</div>`);
   if (air?.pm25 != null) pills.push(`<div class="pill g${air.grade25}">초미세먼지<br><b>${GRADE[air.grade25]}</b> ${air.pm25}</div>`);
   // 우산 칸은 '오늘' 기준 (저녁에는 지금 비가 오거나 밤 강수확률이 높을 때만). 내일 우산은 '내일' 줄에 따로 나옴
