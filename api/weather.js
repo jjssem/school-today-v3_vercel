@@ -3,7 +3,7 @@
 // 인증키: Vercel 환경변수 DATA_GO_KR_KEY (공공데이터포털 '일반 인증키(Decoding)')
 // 공공데이터포털에서 아래 두 서비스를 각각 '활용신청' 해야 같은 키로 둘 다 쓸 수 있습니다.
 //   - 기상청_단기예보 ((구)_동네예보) 조회서비스
-//   - 한국환경공단_에어코리아_대기오염정보
+//   - 한국환경공단_에어코리아_대기오염정보   (실시간 측정값 + 대기질 예보통보)
 //   - 한국환경공단_에어코리아_측정소정보   (가장 가까운 측정소 찾기)
 
 // 등교~하교 시간 (비·강수확률 판단 기준). 기상청 예보는 1시간 단위라
@@ -215,8 +215,17 @@ const SIDO = [["서울","서울"],["부산","부산"],["대구","대구"],["인�
   ["울산","울산"],["세종","세종"],["경기","경기"],["강원","강원"],["충청북","충북"],["충북","충북"],["충청남","충남"],
   ["충남","충남"],["전북","전북"],["전라북","전북"],["전라남","전남"],["전남","전남"],["경상북","경북"],["경북","경북"],
   ["경상남","경남"],["경남","경남"],["제주","제주"]];
+// 주소 맨 앞 낱말(시·도)만 보고 판단 — '경기도 광주시'를 광주로 잘못 읽지 않도록
+// '전남광주통합특별시'는 광주·전남 자료가 따로라, 광주의 5개 구면 광주 먼저 · 나머지 시·군은 전남 먼저
+const GWANGJU_GU = ["동구", "서구", "남구", "북구", "광산구"];
+const sidoNames = addr => {
+  const [head = "", second = ""] = (addr || "").trim().split(/\s+/);
+  const names = [...new Set(SIDO.filter(([k]) => head.includes(k)).map(([, v]) => v))];
+  if (names.includes("광주") && names.includes("전남")) return GWANGJU_GU.includes(second) ? ["광주", "전남"] : ["전남", "광주"];
+  return names;
+};
 async function getAirBySido(sidoText, addrHint) {
-  const names = [...new Set(SIDO.filter(([k]) => (sidoText || "").includes(k)).map(([, v]) => v))];
+  const names = sidoNames(sidoText);
   if (!names.length) throw new Error("시·도를 알 수 없어요");
   const words = (addrHint || "").split(/\s+/).map(w => w.replace(/(시|군|구|읍|면|동)$/, "")).filter(w => w.length >= 2);
   for (const sidoName of names) {
@@ -237,14 +246,73 @@ async function getAir(lat, lon, sido) {
   }
 }
 
+// ── 에어코리아 대기질 예보 (내일 미세먼지) ───────────────────
+// '대기질 예보통보 조회': 하루 4번(5·11·17·23시) 발표, 전국 19개 권역의 등급(좋음·보통·나쁨·매우나쁨).
+// 측정소 값이 아니라 권역 단위 등급이고, 전국 공통 자료라 30분 동안 기억해 둠.
+const DUST_GRADE = { "좋음": 1, "보통": 2, "나쁨": 3, "매우나쁨": 4 };
+// 경기·강원은 예보 권역이 둘로 나뉨 (아래 시·군 목록에 없으면 경기남부·영서)
+// ※ 권역별 시·군 목록은 공개 문서로 확인하지 못해 일반적인 구분을 따름 (김포·태백은 경계 지역)
+const GG_NORTH = ["가평", "고양", "구리", "김포", "남양주", "동두천", "양주", "연천", "의정부", "파주", "포천"];
+const GW_EAST = ["강릉", "동해", "속초", "삼척", "태백", "고성", "양양"];
+function dustRegions(addr) {
+  const second = (addr || "").trim().split(/\s+/)[1] || "";
+  const names = sidoNames(addr);
+  if (names.includes("경기")) return [GG_NORTH.some(c => second.startsWith(c)) ? "경기북부" : "경기남부", "경기"];
+  if (names.includes("강원")) return [GW_EAST.some(c => second.startsWith(c)) ? "영동" : "영서", "강원"];
+  return names;
+}
+// "서울 : 보통,제주 : 좋음,…" → 이 학교 권역의 등급 (권역 이름이 조금 달라도 찾도록 포함 여부로 비교)
+function gradeIn(informGrade, regions) {
+  const rows = String(informGrade || "").split(",").map(x => x.split(":").map(v => v.replace(/\s/g, "")));
+  for (const r of regions) {
+    const hit = rows.find(([name, g]) => name && name.includes(r) && DUST_GRADE[g]);
+    if (hit) return { region: hit[0], grade: DUST_GRADE[hit[1]] };
+  }
+  return null;
+}
+const dashDate = ymd => `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}`;
+let dustCache = {};                                   // 발표일 → { at, items }
+async function getDustItems(searchDate) {
+  const c = dustCache[searchDate];
+  if (c && Date.now() - c.at < 30 * 60e3) return c.items;
+  const items = await getJson(airUrl("ArpltnInforInqireSvc/getMinuDustFrcstDspth", { numOfRows: "100", searchDate }));
+  dustCache = { ...Object.fromEntries(Object.entries(dustCache).slice(-1)), [searchDate]: { at: Date.now(), items } };
+  return items;
+}
+// 내일(targetYmd) 예보: 오늘 발표분에서 찾고, 새벽 5시 전처럼 아직 없으면 어제 발표분(모레 예보)에서 찾음
+async function getDustTomorrow(addr) {
+  const regions = dustRegions(addr);
+  if (!regions.length) throw new Error("시·도를 알 수 없어요");
+  const target = dashDate(kstParts(Date.now() + 86400e3).ymd);
+  const stampOf = t => { const m = String(t || "").match(/(\d{4}-\d{2}-\d{2})\D+(\d{1,2})시/); return m ? m[1] + " " + m[2].padStart(2, "0") : ""; };
+  for (const day of [kstParts().ymd, kstParts(Date.now() - 86400e3).ymd]) {
+    const items = (await getDustItems(dashDate(day))).filter(i => i.informData === target);
+    const out = {};
+    for (const code of ["PM10", "PM25"]) {
+      const latest = items.filter(i => i.informCode === code).sort((a, b) => stampOf(a.dataTime).localeCompare(stampOf(b.dataTime))).at(-1);
+      const g = latest && gradeIn(latest.informGrade, regions);
+      if (g) { out[code] = g.grade; out.region = g.region; out.time = latest.dataTime; (out.raw ||= {})[code] = latest.informGrade; }
+    }
+    if (out.PM10 || out.PM25) {
+      const pm10 = out.PM10 || 0, pm25 = out.PM25 || 0;
+      return { pm10, pm25, worst: Math.max(pm10, pm25), kind: pm25 > pm10 ? "pm25" : "pm10", region: out.region, time: out.time, raw: out.raw };
+    }
+  }
+  return null;                                        // 아직 내일 예보가 없음
+}
+
 // 운동장 활동 판단
 // 내일 운동장 판단 (하교 뒤 저녁·밤에 화면이 쓰는 값): 내일 등하교 시간(7:30~16:30) 예보 기준
-// 미세먼지는 내일 값을 알 수 없어 넣지 않음
-function judgeTomorrow(t) {
+// 미세먼지는 대기질 예보 등급이 '나쁨' 이상이면 주의 (예보는 권역 단위라 실내 권장까지는 올리지 않음)
+function judgeTomorrow(t, dust) {
   if (!t) return null;
   const reasons = [];
   let level = "ok";
   const up = l => { if (l === "no" || level === "ok") level = l; };
+  if (dust?.worst >= 3) {
+    up("caution");
+    reasons.push(`${dust.kind === "pm25" ? "초미세먼지" : "미세먼지"} ${dust.worst === 4 ? "매우나쁨" : "나쁨"} 예보`);
+  }
   if (t.rainHours?.length) { up("caution"); reasons.push(`${t.rainHours[0].hour}시쯤${t.rainHours[0].pty === 3 ? " 눈" : " 비"} 예보`); }
   else if (t.popMax >= 60) { up("caution"); reasons.push(`강수확률 ${t.popMax}%`); }
   if (t.dawnRain) { up("caution"); reasons.push("새벽 비 — 운동장이 젖어 있을 수 있어요"); }
@@ -305,11 +373,12 @@ async function handler(req) {
     return Response.json({ error: "lat, lon 값이 필요해요 (국내 좌표)." }, { status: 400 });
   }
   const grid = toGrid(lat, lon);
-  const [n, t, a, wr] = await Promise.allSettled([getNow(grid), getForecast(grid), getAir(lat, lon, sido), warningsFor(sido)]);
+  const [n, t, a, wr, df] = await Promise.allSettled([getNow(grid), getForecast(grid), getAir(lat, lon, sido), warningsFor(sido), getDustTomorrow(sido)]);
   const now = n.status === "fulfilled" ? n.value : null;
   const today = t.status === "fulfilled" ? t.value.today : null;
   const tomorrow = t.status === "fulfilled" ? t.value.tomorrow : null;
   const air = a.status === "fulfilled" ? a.value : null;
+  const dustTomorrow = df.status === "fulfilled" ? df.value : null;   // 내일 미세먼지 예보 (없거나 실패해도 나머지는 그대로)
   // 특보는 실패해도 나머지 화면은 그대로 (errors.warnings 에만 기록)
   const warnings = wr.status === "fulfilled" ? wr.value.active : null;
   const warnTime = wr.status === "fulfilled" ? wr.value.tmFc : null;
@@ -318,14 +387,15 @@ async function handler(req) {
   if (!now) errors.now = n.reason?.message;
   if (!today) errors.today = t.reason?.message;
   if (!air) errors.air = a.reason?.message;
+  if (df.status !== "fulfilled") errors.dustForecast = df.reason?.message;
   if (!now && !today && !air && !warnings) {
     return Response.json({ error: Object.values(errors)[0] || "날씨 정보를 불러오지 못했어요", errors, grid }, { status: 502 });
   }
   return Response.json(
-    { now, today, tomorrow, air, warnings: warnings || [], warnTime,
+    { now, today, tomorrow, air, dustTomorrow, warnings: warnings || [], warnTime,
       outdoor: judge(now, today, air, warnings),
       outdoorBase: judge(now, today, air, []),       // 화면이 최신 특보를 따로 받아 덧씌울 때 쓰는 기준값
-      outdoorTomorrow: judgeTomorrow(tomorrow),      // 16:30 이후 화면은 이 값(내일 기준)으로 신호등 표시
+      outdoorTomorrow: judgeTomorrow(tomorrow, dustTomorrow),     // 16:30 이후 화면은 이 값(내일 기준)으로 신호등 표시
       errors, grid },
     { headers: {
       "Cache-Control": "public, max-age=300",
